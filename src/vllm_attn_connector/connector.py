@@ -38,6 +38,7 @@ exact -- retained mean mass plus residual is 1 by construction.
 from __future__ import annotations
 
 import math
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,8 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger("vllm.attn_connector")
+
+_DEBUG = bool(os.environ.get("OPAL_ATTN_DEBUG"))
 
 FLOAT_DECIMALS = 6
 FULL_ATTENTION = "full_attention"
@@ -128,6 +131,16 @@ def _model_conf(vllm_config: "VllmConfig") -> dict[str, Any]:
             ("model", "tokenizer", "tokenizer_mode", "trust_remote_code", "max_model_len")}
     conf["dtype"] = str(m.dtype)
     conf["architectures"] = list(getattr(m, "architectures", []) or [])
+    # From hf_text_config, not hf_config. A multimodal model nests the language
+    # model's shape under `text_config`, and the top level has no
+    # num_attention_heads at all -- Qwen3.5 reported 2 query heads against a
+    # true 16 because every lookup missed and the fallback used num_kv_heads.
+    _text = getattr(m, "hf_text_config", None) or getattr(m, "hf_config", None)
+    for _k in ("num_attention_heads", "num_key_value_heads", "head_dim",
+               "num_hidden_layers"):
+        _v = getattr(_text, _k, None)
+        if _v is not None:
+            conf[_k] = int(_v)
     conf["tensor_parallel_size"] = vllm_config.parallel_config.tensor_parallel_size
     for k in ("revision", "tokenizer_revision", "served_model_name"):
         v = getattr(m, k, None)
@@ -252,7 +265,7 @@ class _RequestState:
     working and an immediate OOM.
     """
 
-    __slots__ = ("blocks", "table", "scratch", "colsum", "pos", "val",
+    __slots__ = ("blocks", "table", "tables", "scratch", "colsum", "pos", "val",
                  "resid",
                  "prompt_len", "steps", "dropped", "prompt_token_ids", "event", "started",
                  "seen_computed", "restarts", "k", "plan", "seg_idx", "seg_live",
@@ -260,8 +273,16 @@ class _RequestState:
                  "lsum", "lwins", "hent", "hdev", "hcnt", "hpos", "hval", "hmass")
 
     def __init__(self, prompt_token_ids: list[int] | None):
-        self.blocks: list[int] = []
-        self.table: torch.Tensor | None = None
+        # Block ids are PER KV CACHE GROUP. A uniform model has one group and
+        # the distinction is invisible, but a hybrid one -- full attention
+        # interleaved with gated-delta-net layers, as in Qwen3.5 -- has
+        # several, and the full-attention group is not necessarily index 0.
+        # Taking group 0's ids for every group indexes the attention cache
+        # with another group's block numbers: the kernel then reads unrelated
+        # memory and the scores come back NaN, with nothing logged.
+        self.blocks: dict[int, list[int]] = {}
+        self.tables: dict[int, torch.Tensor] = {}
+        self.table: torch.Tensor | None = None     # group 0, kept for callers
         self.scratch: torch.Tensor | None = None   # (groups, 2, T) acc-mean, running max
         self.colsum: torch.Tensor | None = None    # (groups, 2, T) running sum / max
         self.pos: torch.Tensor | None = None       # (groups, steps, k) int32
@@ -455,6 +476,8 @@ class _WorkerSide:
         self._layouts: dict[str, LayerLayout] = {}
         self._scored: list[_Group] = []
         self._num_q_heads = 0
+        self._dumped = False
+        self._warned_table = False
         self._block_size = 0
         self._state: dict[str, _RequestState] = {}
         self._emitted: set[str] = set()
@@ -533,6 +556,14 @@ class _WorkerSide:
         )
 
     def _infer_query_heads(self) -> int:
+        """Query heads per rank, or a loud complaint.
+
+        Three sources, in descending reliability. The last one -- assuming the
+        model is not using GQA at all -- is a guess, and guessing silently is
+        what let Qwen3.5 run with 2 query heads instead of 16: every scored
+        value was then computed over one eighth of the heads, with nothing in
+        the log to say so.
+        """
         n = self._conf.get("num_attention_heads")
         if n:
             return int(n) // max(1, self._tp_size)
@@ -542,11 +573,29 @@ class _WorkerSide:
             cfg = AutoConfig.from_pretrained(
                 self._conf["model"], trust_remote_code=self._conf.get("trust_remote_code", False)
             )
+            # Multimodal configs nest the language model's shape.
+            cfg = getattr(cfg, "text_config", None) or cfg
             return int(cfg.num_attention_heads) // max(1, self._tp_size)
-        except Exception:
-            return self._scored[0].layers[0].num_kv_heads
+        except Exception as exc:                            # noqa: BLE001
+            fallback = self._scored[0].layers[0].num_kv_heads
+            logger.warning(
+                "attn_connector: could not determine num_attention_heads for "
+                "%s (%s); assuming %d, i.e. no GQA. If the model does use GQA "
+                "this is WRONG and only %d of its query heads will be scored.",
+                self._conf.get("model"), exc, fallback, fallback)
+            return fallback
 
     # -- per-step ----------------------------------------------------------- #
+
+    def _warn_no_table(self, gid: int, tables: dict) -> None:
+        """Complain once. Scoring a group with no block table of its own would
+        mean reading the cache with another group's block numbers."""
+        if not getattr(self, "_warned_table", False):
+            self._warned_table = True
+            logger.warning(
+                "attn_connector: no block table for kv cache group %d "
+                "(have groups %s). This request will not be scored.",
+                gid, sorted(tables))
 
     def _warn_no_query(self, layer_name: str, rows: int) -> None:
         """Complain once. A silent skip here produces all-zero records that pass
@@ -614,8 +663,12 @@ class _WorkerSide:
                         step_req.request_id, st.restarts,
                     )
                 if step_req.new_block_ids:
-                    st.blocks.extend(step_req.new_block_ids[0])
-                    st.table = torch.tensor(st.blocks, dtype=torch.int32, device=device)
+                    for _gi, _new in enumerate(step_req.new_block_ids):
+                        acc = st.blocks.setdefault(_gi, [])
+                        acc.extend(_new)
+                        st.tables[_gi] = torch.tensor(acc, dtype=torch.int32,
+                                                      device=device)
+                    st.table = st.tables.get(0)
                 if step_req.num_scheduled_tokens > 1 or st.prompt_len == 0:
                     # Still prefilling: freeze the prompt length as it grows.
                     st.prompt_len = max(
@@ -625,12 +678,20 @@ class _WorkerSide:
 
             for row_i, step_req in enumerate(decoding):
                 st = self._state[step_req.request_id]
-                if st.table is None or st.prompt_len == 0:
+                if not st.tables or st.prompt_len == 0:
                     continue
                 if self._max_steps and st.steps >= self._max_steps:
                     st.dropped += 1
                     continue
-                n_keys = min(st.prompt_len, len(st.blocks) * self._block_size)
+                # Blocks OF THE GROUP BEING SCORED. `st.blocks` is keyed by
+                # kv cache group, so its len() is the number of groups, not
+                # the number of blocks -- reading it directly capped every
+                # prompt at groups * block_size (4 * 1056 = 4224 on Qwen3.5),
+                # silently truncating the longest prompts and dropping the
+                # declared ranges past the cut.
+                _sg = self._scored[0].gid
+                n_keys = min(st.prompt_len,
+                             len(st.blocks.get(_sg, ())) * self._block_size)
                 if st.n_keys:
                     # Frozen with k on the first decode step: the selection plan
                     # and the buffers are sized to it.
@@ -665,10 +726,37 @@ class _WorkerSide:
                         if q is None:
                             self._warn_no_query(layout.layer_name, n_rows)
                             continue
+                        table = st.tables.get(group.gid)
+                        if table is None:
+                            self._warn_no_table(group.gid, st.tables)
+                            continue
                         probs = decode_attention(
-                            q[row_i], layout.k_view, st.table, n_keys,
+                            q[row_i], layout.k_view, table, n_keys,
                             num_query_heads=self._num_q_heads,
                         )
+                        # OPAL_ATTN_DEBUG=1 dumps the first scored row. An
+                        # all-zero capture is otherwise indistinguishable from
+                        # a working one until the files are read back, and the
+                        # shapes here say immediately whether the problem is
+                        # upstream (q or the cache view) or downstream
+                        # (selection).
+                        if _DEBUG and not self._dumped:
+                            self._dumped = True
+                            logger.warning(
+                                "attn_connector DEBUG layer=%s gid=%d "
+                                "groups_with_blocks=%s table[:4]=%s "
+                                "table.max=%s n_blocks_in_cache=%d "
+                                "q_row=%s k_view=%s n_keys=%d num_q_heads=%d "
+                                "probs=%s probs.max=%.6g row0.sum=%.6g "
+                                "qrow.absmax=%.6g",
+                                layout.layer_name, group.gid, sorted(st.tables),
+                                table[:4].tolist(), int(table.max()),
+                                layout.k_view.shape[0],
+                                tuple(q[row_i].shape),
+                                tuple(layout.k_view.shape), n_keys,
+                                self._num_q_heads, tuple(probs.shape),
+                                float(probs.max()), float(probs[0].sum()),
+                                float(q[row_i].abs().max()))
                         if self._layer_stats and n_keys > 1:
                             _ = None
                             # Per-head shape statistics, sink excluded: it takes
