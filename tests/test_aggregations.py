@@ -18,9 +18,23 @@ Run: python experiments/vllm-attn-connector/test_aggregations.py
 """
 from __future__ import annotations
 
+import importlib.util
+import pathlib
 import sys
 
 import torch
+
+# Loaded by PATH, not as `vllm_attn_connector.kernels`: importing the package
+# runs its __init__, which imports connector.py, which imports vLLM. This file
+# is the suite that must run with no GPU and no vLLM, and kernels.py itself has
+# no vLLM dependency -- only the package entry point does.
+_KERNELS = (pathlib.Path(__file__).resolve().parent.parent
+            / "src" / "vllm_attn_connector" / "kernels.py")
+_spec = importlib.util.spec_from_file_location("_attn_kernels", _KERNELS)
+_kernels = importlib.util.module_from_spec(_spec)
+sys.modules["_attn_kernels"] = _kernels
+_spec.loader.exec_module(_kernels)
+decode_attention_torch = _kernels.decode_attention_torch
 
 
 def streaming(layers: list[torch.Tensor]):
@@ -161,6 +175,59 @@ def _load_segment_fns():
     ns = {"torch": torch, "NO_ENTRY": -1}
     exec(compile(mod, "<connector>", "exec"), ns)
     return ns
+
+
+def test_block_sizes_not_powers_of_two() -> None:
+    """The reference scores every cached position at any paged block size.
+
+    Triton's ``tl.arange`` needs a power-of-two extent, but vLLM chooses the
+    paged block size per model and backend and does not guarantee one: a
+    Qwen3.5 MoE (head_dim 256, 2 KV heads) picked a value that made the kernel
+    fail to compile with "arange's range must be a power of 2". The kernel now
+    iterates a padded extent and masks the tail, exactly as it already did for
+    head_size via PAD_D.
+
+    This test covers the torch reference rather than the Triton kernel, since
+    it has to run without a GPU -- but it pins the arithmetic the padded kernel
+    has to reproduce: every position in [0, n_keys) is scored exactly once, and
+    none of the padding leaks in.
+    """
+    import math
+
+    def naive(q, kv, bt, n_keys, nqh):
+        bs, nkv, hd = kv.shape[1], kv.shape[2], kv.shape[3]
+        group = nqh // nkv
+        out = torch.zeros(nqh, n_keys)
+        for pos in range(n_keys):
+            blk, off = bt[pos // bs].item(), pos % bs
+            for h in range(nqh):
+                out[h, pos] = (q[h].float() * kv[blk, off, h // group].float()
+                               ).sum() / math.sqrt(hd)
+        return torch.softmax(out, dim=-1)
+
+    torch.manual_seed(0)
+    for block_size in (16, 12, 24, 48, 80, 100):
+        nqh, nkv, head_dim, n_blocks = 8, 2, 64, 6
+        q = torch.randn(nqh, head_dim)
+        kv = torch.randn(n_blocks, block_size, nkv, head_dim)
+        bt = torch.arange(n_blocks)
+        # a partial final block, so the n_keys mask is exercised too
+        n_keys = min(block_size * n_blocks, block_size * 3 + 5)
+        got = decode_attention_torch(q, kv, bt, n_keys, num_query_heads=nqh)
+        want = naive(q, kv, bt, n_keys, nqh)
+        assert got.shape == (nqh, n_keys), (block_size, got.shape)
+        assert torch.allclose(got, want, atol=1e-5), (
+            f"block_size={block_size}: max diff "
+            f"{(got - want).abs().max().item():.2e}")
+        assert torch.allclose(got.sum(-1), torch.ones(nqh), atol=1e-5)
+
+    # and the padding arithmetic itself: n < BLOCK_SIZE must leave no gaps
+    for block_size in (12, 24, 80):
+        pad_n = 1 << (block_size - 1).bit_length()
+        covered = sorted({b * block_size + n
+                          for b in range(3) for n in range(pad_n)
+                          if n < block_size and b * block_size + n < block_size * 3})
+        assert covered == list(range(block_size * 3)), block_size
 
 
 def test_segments() -> None:
