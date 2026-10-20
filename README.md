@@ -104,9 +104,28 @@ export FLOWCEPT_SETTINGS_PATH="$ROOT/flowcept/agent_sandbox/settings.yaml"
 Flowcept must come from a checkout that contains
 `flowceptor/adapters/vllm/`.
 
-Requires a CUDA device and Triton. Tested against vLLM 0.27.x with
+Requires a CUDA device and Triton. Tested against vLLM 0.27.x and 0.28.0 with
 `VLLM_ENABLE_V1_MULTIPROCESSING=0`; with multiprocessing enabled the emitted
 records leave the process and Flowcept needs a reachable message queue.
+
+### Cache layouts
+
+Uniform caches and **hybrid** ones both work. A hybrid model interleaves full
+attention with another mechanism — gated delta net in Qwen3.5 — so only some
+layers have a scorable KV cache, and vLLM gives each kind its own cache group
+with its own block table. The connector scores the full-attention group and
+takes its block ids from that group, not from group 0.
+
+Two consequences worth knowing before adding a model:
+
+- **The paged block size need not be a power of two.** vLLM sizes a hybrid
+  model's attention page to match the other mechanism's state page; Qwen3.5
+  uses 1056 tokens. The kernel walks each block in fixed 128-token tiles for
+  this reason, so block size is unconstrained.
+- **Multimodal configs nest the language model's shape** under
+  `text_config`. Head counts are read from `hf_text_config`; if that ever
+  fails the fallback warns rather than guessing, because guessing wrong means
+  scoring a fraction of the heads with nothing in the log.
 
 ## Quickstart
 
@@ -496,3 +515,10 @@ and single-key sequences.
   `restarts` is incremented.
 - **`layout.py` is vendored**, duplicated with `vllm-kvnorm`. If a third package
   needs it, extract a shared dependency instead of copying again.
+- **A dead capture is not self-announcing.** If the probe never fires, or the
+  cache is read with the wrong block table, every record is still written and
+  is still structurally valid: the manifest matches, the declared ranges are
+  present, and mass conservation holds because `0 + 1 == 1`. Two checks do
+  catch it, and a consumer should run both — that any retained position is
+  `> 0`, and that `attn_sum` totals one softmax unit per recorded decode step.
+  `tests/e2e_smoke.py` asserts the second; nothing asserts either at runtime.
